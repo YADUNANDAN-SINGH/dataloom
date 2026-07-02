@@ -283,9 +283,24 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
       {
         group: "Save",
         items: [
-          { label: "Save", icon: LuSave, onClick: handleSave },
-          { label: "Export", icon: LuDownload, onClick: () => setShowExportModal(true) },
-          { label: "Undo", icon: LuUndo2, onClick: handleUndo },
+          {
+            label: "Save",
+            icon: LuSave,
+            onClick: handleSave,
+            hover: "Save the current state of the project as a new checkpoint.",
+          },
+          {
+            label: "Export",
+            icon: LuDownload,
+            onClick: () => setShowExportModal(true),
+            hover: "Export the data to a file.",
+          },
+          {
+            label: "Undo",
+            icon: LuUndo2,
+            onClick: handleUndo,
+            hover: "Undo the last transformation.",
+          },
         ],
       },
       {
@@ -296,12 +311,14 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             icon: LuHistory,
             formType: "Logs",
             onClick: () => handleMenuClick("Logs"),
+            hover: "View the history of transformations.",
           },
           {
             label: "Checkpoints",
             icon: LuBookmark,
             formType: "Checkpoints",
             onClick: () => handleMenuClick("Checkpoints"),
+            hover: "View and revert to previous checkpoints.",
           },
         ],
       },
@@ -316,6 +333,7 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             formType: "FilterForm",
             disabled: isPreviewMode,
             onClick: () => handleMenuClick("FilterForm"),
+            hover: "Filter rows based on conditions you specify.",
           },
           {
             label: "Sample",
@@ -323,6 +341,7 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             formType: "SampleRowsForm",
             disabled: isPreviewMode,
             onClick: () => handleMenuClick("SampleRowsForm"),
+            hover: "Take a random sample of rows from the dataset.",
           },
           {
             label: "Sort",
@@ -330,6 +349,7 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             formType: "SortForm",
             disabled: isPreviewMode,
             onClick: () => handleMenuClick("SortForm"),
+            hover: "Sort rows based on one or more columns.",
           },
           {
             label: "Drop Dup",
@@ -337,6 +357,7 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             formType: "DropDuplicateForm",
             disabled: isPreviewMode,
             onClick: () => handleMenuClick("DropDuplicateForm"),
+            hover: "Drop duplicate rows from the dataset.",
           },
           {
             label: "GroupBy",
@@ -344,6 +365,7 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             formType: "GroupByForm",
             disabled: isPreviewMode,
             onClick: () => handleMenuClick("GroupByForm"),
+            hover: "Group rows by one or more columns and apply an aggregation.",
           },
           {
             label: "Cast Type",
@@ -351,6 +373,7 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             formType: "CastDataTypeForm",
             disabled: isPreviewMode,
             onClick: () => handleMenuClick("CastDataTypeForm"),
+            hover: "Change the data type of a column.",
           },
           {
             label: "Trim Space",
@@ -358,6 +381,7 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             formType: "TrimWhitespaceForm",
             disabled: isPreviewMode,
             onClick: () => handleMenuClick("TrimWhitespaceForm"),
+            hover: "Trim whitespace from the beginning and end of a column.",
           },
           {
             label: "Replace",
@@ -365,6 +389,7 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             formType: "StringReplaceForm",
             disabled: isPreviewMode,
             onClick: () => handleMenuClick("StringReplaceForm"),
+            hover: "Replace a string in a column with another string.",
           },
           {
             label: "Fill Empty",
@@ -372,6 +397,7 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             formType: "FillEmptyForm",
             disabled: isPreviewMode,
             onClick: () => handleMenuClick("FillEmptyForm"),
+            hover: "Fill empty cells in a column with a specific value.",
           },
         ],
       },
@@ -384,6 +410,7 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             formType: "AdvQueryFilterForm",
             disabled: isPreviewMode,
             onClick: () => handleMenuClick("AdvQueryFilterForm"),
+            hover: "Filter rows using a SQL-like query.",
           },
           {
             label: "Pivot Table",
@@ -391,6 +418,7 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             formType: "PivotTableForm",
             disabled: isPreviewMode,
             onClick: () => handleMenuClick("PivotTableForm"),
+            hover: "Create a pivot table from the data.",
           },
           {
             label: "Melt (Unpivot)",
@@ -398,6 +426,7 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             formType: "MeltForm",
             disabled: isPreviewMode,
             onClick: () => handleMenuClick("MeltForm"),
+            hover: "Unpivot the data from a wide to a long format.",
           },
         ],
       },
@@ -411,12 +440,14 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
             icon: LuLayoutDashboard,
             formType: "DatasetSummary",
             onClick: () => handleMenuClick("DatasetSummary"),
+            hover: "View a summary of the dataset.",
           },
           {
             label: "Columns",
             icon: LuColumns3,
             active: columnProfilesActive,
             onClick: onToggleColumnProfiles,
+            hover: "View the profile of each column.",
           },
         ],
       },
@@ -456,6 +487,7 @@ const MenuNavbar = ({ projectId, columnProfilesActive, onToggleColumnProfiles })
                       data-testid={`toolbar-${item.label.toLowerCase().replace(/ /g, "-")}`}
                       onClick={item.onClick}
                       disabled={item.disabled}
+                      title={item.hover}
                       className={`flex flex-col items-center gap-1 px-3 py-1.5 rounded-md transition-colors ${
                         isActive
                           ? "bg-blue-50 text-blue-600"
