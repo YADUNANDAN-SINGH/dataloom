@@ -181,7 +181,7 @@ def delete_row(df: pd.DataFrame, index: int) -> pd.DataFrame:
     """
     if index < 0 or index >= len(df):
         raise TransformationError(f"Row index {index} out of range (0-{len(df) - 1})")
-    return df.drop(index).reset_index(drop=True)
+    return pd.concat([df.iloc[:index], df.iloc[index + 1 :]]).reset_index(drop=True)
 
 
 def add_column(df: pd.DataFrame, index: int, name: str) -> pd.DataFrame:
@@ -359,7 +359,7 @@ def change_cell_value(
             value = parsed
 
     try:
-        df.at[row_index, column_name] = value
+        df.iat[row_index, col_index - 1] = value
     except (TypeError, ValueError, OverflowError) as exc:
         raise TransformationError(
             f"Cannot store {value!r} in column '{column_name}' ({df[column_name].dtype})."
@@ -657,11 +657,11 @@ def string_replace(df: pd.DataFrame, column: str, find_value: str, replace_value
     if column not in df.columns:
         raise TransformationError(f"Column '{column}' not found")
 
-    if not (pd.api.types.is_string_dtype(df[column]) or pd.api.types.is_object_dtype(df[column])):
-        raise TransformationError(
-            f"Column '{column}' is not a string column (dtype: {df[column].dtype}). "
-            "Cast it to string first before using string replace."
-        )
+    # if not (pd.api.types.is_string_dtype(df[column]) or pd.api.types.is_object_dtype(df[column])):
+    #     raise TransformationError(
+    #         f"Column '{column}' is not a string column (dtype: {df[column].dtype}). "
+    #         "Cast it to string first before using string replace."
+    #     )
 
     df = df.copy()
     df[column] = df[column].astype(str).str.replace(find_value, replace_value, regex=False)

@@ -1,6 +1,7 @@
 """Pydantic request/response schemas for all API endpoints."""
 
 import datetime
+import re
 import uuid
 from enum import StrEnum
 from typing import Any
@@ -412,6 +413,13 @@ class ProjectResponse(BaseModel):
     dtypes: dict[str, str] = {}
 
 
+class UndoStateResponse(BaseModel):
+    """Whether Undo and Redo have anything to act on, so the UI can disable them."""
+
+    can_undo: bool
+    can_redo: bool
+
+
 # --- Add-file (append) schemas ---
 
 
@@ -670,12 +678,20 @@ class LogResponse(BaseModel):
 
 
 class LastResponse(BaseModel):
-    """Response for recently modified projects."""
+    """Response for recently modified projects.
+
+    The dataset fields describe the working copy on disk. They are ``None``
+    when the endpoint does not compute them or the file cannot be read.
+    """
 
     project_id: uuid.UUID
     name: str
     description: str | None
     last_modified: datetime.datetime
+    upload_date: datetime.datetime | None = None
+    file_size_bytes: int | None = None
+    row_count: int | None = None
+    column_count: int | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -696,12 +712,25 @@ class SignupRequest(BaseModel):
 
     @field_validator("password")
     @classmethod
-    def password_length_ok(cls, v: str) -> str:
+    def validate_password(cls, v: str) -> str:
         byte_len = len(v.encode("utf-8"))
         if byte_len < 8:
             raise ValueError("password must be at least 8 characters")
         if byte_len > 72:
             raise ValueError("password must be at most 72 bytes")
+
+        score = sum(
+            [
+                bool(re.search(r"[a-z]", v)),
+                bool(re.search(r"[A-Z]", v)),
+                bool(re.search(r"\d", v)),
+                bool(re.search(r"[^A-Za-z0-9]", v)),
+            ]
+        )
+
+        if score < 3:
+            raise ValueError("password must contain at least 3 of: lowercase, uppercase, digit, special character")
+
         return v
 
 
@@ -764,12 +793,27 @@ class ChangePasswordRequest(BaseModel):
 
     @field_validator("new_password")
     @classmethod
-    def password_length_ok(cls, v: str) -> str:
+    def validate_password(cls, v: str) -> str:
         byte_len = len(v.encode("utf-8"))
+
         if byte_len < 8:
             raise ValueError("password must be at least 8 characters")
+
         if byte_len > 72:
             raise ValueError("password must be at most 72 bytes")
+
+        score = sum(
+            [
+                bool(re.search(r"[a-z]", v)),
+                bool(re.search(r"[A-Z]", v)),
+                bool(re.search(r"\d", v)),
+                bool(re.search(r"[^A-Za-z0-9]", v)),
+            ]
+        )
+
+        if score < 3:
+            raise ValueError("password must contain at least 3 of: lowercase, uppercase, digit, special character")
+
         return v
 
 
