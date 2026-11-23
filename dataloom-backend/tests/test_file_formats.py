@@ -6,7 +6,13 @@ import pandas as pd
 import pytest
 from fastapi import HTTPException
 
-from app.utils.file_formats import TableWriteOptions, get_format, supported_extensions
+from app.utils.file_formats import (
+    SPREADSHEET_EXPORT_EXTENSIONS,
+    TableWriteOptions,
+    get_format,
+    sanitize_formula_cells,
+    supported_extensions,
+)
 from app.utils.pandas_helpers import read_table_safe, save_table_safe
 
 
@@ -190,6 +196,18 @@ class TestRoundTrip:
             "2022",
         ]
 
+    @pytest.mark.parametrize("ext", [".csv", ".tsv"])
+    def test_delimited_write_emits_lf_only(self, ext, tmp_path):
+        """CSV/TSV must be written with LF line endings, never CRLF (Windows regression)."""
+        df = pd.DataFrame({"name": ["Alice", "Bob"], "note": ["plain", "line one\nline two"]})
+        path = tmp_path / f"data{ext}"
+
+        get_format(path).write(df, path, TableWriteOptions())
+
+        data = path.read_bytes()
+        assert b"\r" not in data
+        assert data.count(b"\n") == 4  # header + 2 rows + the newline embedded in a field
+
 
 class TestJson:
     def test_flat_records(self, tmp_path):
@@ -279,3 +297,88 @@ class TestHelperErrors:
         with pytest.raises(HTTPException) as exc:
             read_table_safe(tmp_path / "nope.csv")
         assert exc.value.status_code == 404
+
+
+class TestSanitizeFormulaCells:
+    def test_spreadsheet_extensions_are_the_writable_spreadsheet_formats(self):
+        assert frozenset({".csv", ".tsv", ".xlsx"}) == SPREADSHEET_EXPORT_EXTENSIONS
+
+    def test_formula_leading_cells_are_prefixed_with_a_quote(self):
+        df = pd.DataFrame(
+            {
+                "note": [
+                    "=1+1",
+                    "+2+2+cmd|' /C calc'!A0",
+                    "-2+3+cmd|' /C calc'!A0",
+                    "@SUM(A1:A10)",
+                    "  =1+1",
+                    "\t@SUM(A1:A10)",
+                ]
+            }
+        )
+
+        result = sanitize_formula_cells(df)
+
+        assert result["note"].tolist() == [
+            "'=1+1",
+            "'+2+2+cmd|' /C calc'!A0",
+            "'-2+3+cmd|' /C calc'!A0",
+            "'@SUM(A1:A10)",
+            "'  =1+1",
+            "'\t@SUM(A1:A10)",
+        ]
+
+    def test_plain_values_and_plain_numbers_are_untouched(self):
+        df = pd.DataFrame({"note": ["hello", "-5", "+3.14", "-.5", "1e5", "", "a=b"]})
+
+        result = sanitize_formula_cells(df)
+
+        assert result["note"].tolist() == ["hello", "-5", "+3.14", "-.5", "1e5", "", "a=b"]
+
+    def test_non_text_columns_and_cells_pass_through(self):
+        df = pd.DataFrame({"n": [1, -5, 3], "note": ["=1+1", None, "ok"]})
+
+        result = sanitize_formula_cells(df)
+
+        assert result["n"].tolist() == [1, -5, 3]
+        assert result["note"].iloc[0] == "'=1+1"
+        assert pd.isna(result["note"].iloc[1])
+        assert result["note"].iloc[2] == "ok"
+
+    def test_input_frame_is_not_mutated(self):
+        df = pd.DataFrame({"note": ["=1+1"]})
+
+        sanitize_formula_cells(df)
+
+        assert df["note"].tolist() == ["=1+1"]
+
+    def test_formula_leading_headers_are_prefixed_with_a_quote(self):
+        df = pd.DataFrame(
+            {
+                "=2+5": ["Alice"],
+                "@cmd": ["Bob"],
+                "+total": ["Carol"],
+                "  -off": ["Dave"],
+                "note": ["hello"],
+            }
+        )
+
+        result = sanitize_formula_cells(df)
+
+        assert list(result.columns) == ["'=2+5", "'@cmd", "'+total", "'  -off", "note"]
+        # Cell values are neutralised by the same rule, as before.
+        assert result["note"].tolist() == ["hello"]
+
+    def test_plain_number_and_normal_headers_are_untouched(self):
+        df = pd.DataFrame({"-5": ["a"], "name": ["b"], 0: ["c"]})
+
+        result = sanitize_formula_cells(df)
+
+        assert list(result.columns) == ["-5", "name", 0]
+
+    def test_header_neutralisation_does_not_mutate_the_input_frame(self):
+        df = pd.DataFrame({"=2+5": ["Alice"]})
+
+        sanitize_formula_cells(df)
+
+        assert list(df.columns) == ["=2+5"]

@@ -48,6 +48,9 @@ class OperationType(StrEnum):
     addFile = "addFile"
     addFormulaCol = "addFormulaCol"
     standardizeDates = "standardizeDates"
+    mergeDataset = "mergeDataset"
+    handleOutliers = "handleOutliers"
+    scaleNumeric = "scaleNumeric"
 
 
 class DropDup(StrEnum):
@@ -223,6 +226,70 @@ class StandardizeDatesParams(BaseModel):
     output_format: DateOutputFormat
 
 
+class OutlierTransformMethod(StrEnum):
+    """Statistical method for identifying outlier values in transformations."""
+
+    iqr = "iqr"
+    zscore = "zscore"
+    percentile = "percentile"
+
+
+class OutlierAction(StrEnum):
+    """Action to take on detected outlier values."""
+
+    clip = "clip"
+    drop = "drop"
+    set_null = "set_null"
+    flag = "flag"
+
+
+class OutlierParams(BaseModel):
+    """Parameters for statistical outlier detection and remediation."""
+
+    column: str
+    method: OutlierTransformMethod = OutlierTransformMethod.iqr
+    action: OutlierAction = OutlierAction.clip
+    sensitivity: float | None = Field(default=None, gt=0.0)
+    lower_percentile: float | None = Field(default=None, ge=0.0, le=1.0)
+    upper_percentile: float | None = Field(default=None, ge=0.0, le=1.0)
+    flag_column: str | None = None
+
+    @model_validator(mode="after")
+    def validate_percentiles(self):
+        eff_lower = 0.01 if self.lower_percentile is None else self.lower_percentile
+        eff_upper = 0.99 if self.upper_percentile is None else self.upper_percentile
+        if eff_lower >= eff_upper:
+            raise ValueError(
+                f"lower_percentile ({eff_lower}) must be strictly less than upper_percentile ({eff_upper})"
+            )
+        return self
+
+
+class ScalingMethod(StrEnum):
+    """Supported mathematical methods for scaling numeric features."""
+
+    minmax = "minmax"
+    standard = "standard"
+    robust = "robust"
+    maxabs = "maxabs"
+
+
+class ScaleNumericParams(BaseModel):
+    """Parameters for scaling and normalizing numeric columns."""
+
+    column: str
+    method: ScalingMethod = ScalingMethod.minmax
+    target_min: float = 0.0
+    target_max: float = 1.0
+    output_column: str | None = None
+
+    @model_validator(mode="after")
+    def validate_target_range(self):
+        if self.method == ScalingMethod.minmax and self.target_min >= self.target_max:
+            raise ValueError("target_min must be strictly less than target_max for minmax scaling")
+        return self
+
+
 class TrimWhitespaceParams(BaseModel):
     """Parameters for trimming whitespace from columns."""
 
@@ -380,6 +447,8 @@ class TransformationInput(BaseModel):
     string_replace_params: StringReplaceParams | None = None
     formula_col_params: FormulaColumnParams | None = None
     standardize_dates_params: StandardizeDatesParams | None = None
+    outlier_params: OutlierParams | None = None
+    scale_numeric_params: ScaleNumericParams | None = None
 
 
 class BasicQueryResponse(BaseModel):
@@ -832,6 +901,11 @@ class ForgotPasswordRequest(BaseModel):
 
     email: EmailStr
 
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v: str) -> str:
+        return v.lower()
+
 
 class ResetPasswordRequest(BaseModel):
     """Request body for resetting password with token."""
@@ -867,6 +941,11 @@ class UpdateEmailRequest(BaseModel):
     """Request body for updating the authenticated user's email."""
 
     email: EmailStr
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v: str) -> str:
+        return v.lower()
 
 
 class ChangePasswordRequest(BaseModel):
@@ -1094,3 +1173,73 @@ class JobResponse(BaseModel):
     created_at: datetime.datetime
     started_at: datetime.datetime | None
     finished_at: datetime.datetime | None
+
+
+# --- Merge Schemas ---
+
+
+class JoinType(StrEnum):
+    """Supported SQL-standard relational join methods."""
+
+    inner = "inner"
+    left = "left"
+    right = "right"
+    outer = "outer"
+    cross = "cross"
+
+    # Uppercase aliases for backward-compatible member access
+    INNER = "inner"
+    LEFT = "left"
+    RIGHT = "right"
+    OUTER = "outer"
+    CROSS = "cross"
+
+
+class MergeAnalyzeRequest(BaseModel):
+    """Request model for pre-merge alignment analysis against a target project."""
+
+    target_project_id: uuid.UUID
+    left_on: list[str] | str | None = None
+    right_on: list[str] | str | None = None
+    how: JoinType = JoinType.inner
+    suffixes: tuple[str, str] = ("_left", "_right")
+
+
+class MergeColumnInfo(BaseModel):
+    """Information on a column projected in a merge result."""
+
+    name: str
+    dtype: str
+
+
+class MergeAnalysisResponse(BaseModel):
+    """Diagnostic metrics and match rates returned by pre-merge analysis."""
+
+    relationship: str
+    left_row_count: int
+    right_row_count: int
+    matched_left_rows: int
+    unmatched_left_rows: int
+    match_rate_left: float
+    matched_right_rows: int
+    unmatched_right_rows: int
+    match_rate_right: float
+    estimated_output_rows: int
+    has_duplicate_left_keys: bool
+    has_duplicate_right_keys: bool
+    warning: str | None = None
+    column_conflicts: list[str]
+    resulting_columns: list[MergeColumnInfo]
+    sample_unmatched_left_keys: list[JsonValue]
+    sample_unmatched_right_keys: list[JsonValue]
+
+
+class MergeExecuteRequest(BaseModel):
+    """Request payload to execute a relational dataset merge."""
+
+    target_project_id: uuid.UUID
+    left_on: list[str] | str | None = None
+    right_on: list[str] | str | None = None
+    how: JoinType = JoinType.inner
+    suffixes: tuple[str, str] = ("_left", "_right")
+    max_rows_limit: int | None = Field(default=1_000_000, description="Cartesian safety ceiling")

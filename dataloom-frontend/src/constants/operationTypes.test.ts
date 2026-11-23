@@ -18,4 +18,6 @@ test("operation type constants match backend contract", () => {
   expect(ops.DROP_NA).toBe("dropNa");
   expect(ops.MELT).toBe("melt");
   expect(ops.ADD_FILE).toBe("addFile");
+  expect(ops.HANDLE_OUTLIERS).toBe("handleOutliers");
+  expect(ops.SCALE_NUMERIC).toBe("scaleNumeric");
 });

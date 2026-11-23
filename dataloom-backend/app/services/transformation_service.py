@@ -5,8 +5,10 @@ No side effects -- saving to disk is handled by the caller.
 """
 
 import math
+import numbers
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +42,41 @@ def _parse_bool(value) -> bool | None:
     if normalized in _FALSE_TOKENS:
         return False
     return None
+
+
+def _cast_to_bool(value, column: str) -> bool | None:
+    """Interpret one value as a boolean for :func:`cast_data_type`.
+
+    Nulls and blank strings stay null. Integral numbers map 1/0 (including 1.0/0.0, whose
+    string form "1.0" is not a boolean token), and every other value must
+    be one of the :func:`_parse_bool` tokens. Anything else raises
+    TransformationError instead of silently becoming null: the previous
+    implementation mapped every unrecognised value (e.g. "maybe", 2, 1.0)
+    to None, so casting a column to boolean quietly destroyed its data.
+    """
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        raise TransformationError(f"Cannot interpret {value!r} as boolean for column '{column}'.") from None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, numbers.Real):
+        if float(value) in (0.0, 1.0):
+            return bool(value)
+        raise TransformationError(
+            f"Cannot interpret {value!r} as boolean for column '{column}'. "
+            "Expected a boolean value: true, false, 1, 0, yes, no, t, f, y, n, on, off."
+        )
+    if isinstance(value, str) and not value.strip():
+        return None
+    parsed = _parse_bool(value)
+    if parsed is None:
+        raise TransformationError(
+            f"Cannot interpret {value!r} as boolean for column '{column}'. "
+            "Expected a boolean value: true, false, 1, 0, yes, no, t, f, y, n, on, off."
+        )
+    return parsed
 
 
 def get_column_type(df: pd.DataFrame, column: str) -> str:
@@ -99,6 +136,14 @@ def apply_filter(df: pd.DataFrame, column: str, condition: str, value: str) -> p
             value = float(value)
         except ValueError:
             raise TransformationError(f"Invalid numeric value: {value}") from None
+        if math.isnan(value):
+            # NaN never equals anything, not even itself, so "=" would
+            # silently return no rows (even when the column holds NaN) and
+            # "!=" would silently return every row including the NaN ones.
+            raise TransformationError(
+                "Invalid numeric value: 'nan' never matches any row "
+                "(NaN is never equal to itself). Use dropNa to remove missing values."
+            )
     elif col_type == "boolean" and condition in ("=", "!=", ">", "<", ">=", "<="):
         parsed = _parse_bool(value)
         if parsed is None:
@@ -106,6 +151,16 @@ def apply_filter(df: pd.DataFrame, column: str, condition: str, value: str) -> p
                 f"Invalid boolean value: {value}. Expected one of: true/false, 1/0, yes/no, t/f, y/n, on/off."
             )
         value = parsed
+    elif pd.api.types.is_datetime64_any_dtype(df[column].dtype) and condition in ("=", "!=", ">", "<", ">=", "<="):
+        # Numeric and boolean columns validate their filter value above; a
+        # datetime column got no equivalent check, so an unparseable value
+        # reached pandas and raised a raw TypeError (HTTP 500). Validate
+        # parseability here (the original string is kept, so pandas still
+        # does the actual comparison) and reject anything unparseable.
+        try:
+            pd.to_datetime(value)
+        except (ValueError, TypeError, OverflowError):
+            raise TransformationError(f"Invalid datetime value: {value}") from None
 
     ops = {
         "=": lambda col, val: (
@@ -130,7 +185,15 @@ def apply_filter(df: pd.DataFrame, column: str, condition: str, value: str) -> p
     if condition_str not in ops:
         raise TransformationError(f"Unsupported filter condition: {condition_str}")
 
-    return ops[condition_str](df[column], value)
+    try:
+        return ops[condition_str](df[column], value)
+    except (TypeError, ValueError) as exc:
+        # Ordering comparisons on values that cannot be compared (e.g. a
+        # mixed-type object column, or a tz-aware column against a naive
+        # value) must surface as a client error, not a 500.
+        raise TransformationError(
+            f"Cannot apply filter condition '{condition_str}' to column '{column}': {exc}"
+        ) from exc
 
 
 def apply_sort(
@@ -168,14 +231,28 @@ def apply_sort(
             columns.append(col_name)
             ascending_list.append(criterion.get("ascending", True))
 
-        return df.sort_values(by=columns, ascending=ascending_list)
+        try:
+            return df.sort_values(by=columns, ascending=ascending_list)
+        except TypeError as e:
+            # A column can hold mixed Python types (e.g. a JSON upload whose
+            # records disagree on a key's type); pandas then cannot compare
+            # its values, which is a client error, not a server fault.
+            raise TransformationError(
+                f"Cannot sort by columns {columns}: values have mixed types that cannot be compared"
+            ) from e
 
     # Single-column mode (backward compatible)
     if column is None:
         raise TransformationError("Column name is required for sorting")
     if column not in df.columns:
         raise TransformationError(f"Column '{column}' not found")
-    return df.sort_values(by=column, ascending=ascending)
+    try:
+        return df.sort_values(by=column, ascending=ascending)
+    except TypeError as e:
+        # See the criteria path above: mixed-type values cannot be compared.
+        raise TransformationError(
+            f"Cannot sort by column '{column}': values have mixed types that cannot be compared"
+        ) from e
 
 
 def add_row(df: pd.DataFrame, index: int) -> pd.DataFrame:
@@ -191,8 +268,19 @@ def add_row(df: pd.DataFrame, index: int) -> pd.DataFrame:
     if index < 0 or index > len(df):
         raise TransformationError(f"Row index {index} out of range (0-{len(df)})")
 
-    new_row = pd.DataFrame([[" "] * len(df.columns)], columns=df.columns, index=[index])
-    return pd.concat([df.iloc[:index], new_row, df.iloc[index:]]).reset_index(drop=True)
+    # Use real missing values so numeric columns stay numeric (a " " placeholder
+    # turned them into text and broke sort/filter on them).
+    new_row = df.iloc[:0].reindex([index])
+    result = pd.concat([df.iloc[:index], new_row, df.iloc[index:]]).reset_index(drop=True)
+
+    # A missing value would upcast int columns to float and bool columns to
+    # object; keep them typed with pandas' nullable Int64 and boolean dtypes.
+    for column in df.columns:
+        if pd.api.types.is_bool_dtype(df[column]):
+            result[column] = result[column].astype("boolean")
+        elif pd.api.types.is_integer_dtype(df[column]):
+            result[column] = result[column].astype("Int64")
+    return result
 
 
 def delete_row(df: pd.DataFrame, index: int) -> pd.DataFrame:
@@ -244,6 +332,14 @@ def delete_column(df: pd.DataFrame, index: int) -> pd.DataFrame:
     """
     if index < 0 or index >= len(df.columns):
         raise TransformationError(f"Column index {index} out of range (0-{len(df.columns) - 1})")
+
+    if len(df.columns) == 1:
+        # Deleting the only column leaves a zero-column frame. Saving that
+        # writes an empty file, and the next read of a CSV/TSV working copy
+        # fails with "No columns to parse from file", so the project stops
+        # loading until an undo or revert. A dataset with no columns is not
+        # a usable state, so refuse it here instead of persisting it.
+        raise TransformationError("Cannot delete the only remaining column")
 
     column_name = df.columns[index]
     return df.drop(column_name, axis=1)
@@ -324,6 +420,20 @@ def change_cell_value(
                 # integers retain their exact values.
                 df[column_name] = df[column_name].astype(object)
                 value = decimal_value
+            else:
+                # Reject values the column dtype cannot store: pandas raises
+                # an uncaught AssertionError when such a value is assigned
+                # below (HTTP 500), instead of a catchable error.
+                bits = 8 * col_dtype.itemsize
+                if col_dtype.kind == "u":
+                    low, high = 0, 2**bits - 1
+                else:
+                    low, high = -(2 ** (bits - 1)), 2 ** (bits - 1) - 1
+                if value < low or value > high:
+                    raise TransformationError(
+                        f"Value {value!r} is out of range for integer column "
+                        f"'{column_name}' ({col_dtype}: {low} to {high})."
+                    )
 
         elif pd.api.types.is_float_dtype(col_dtype):
             try:
@@ -339,7 +449,7 @@ def change_cell_value(
                 )
 
         elif pd.api.types.is_bool_dtype(col_dtype):
-            # Accepted tokens are a superset of cast_data_type()'s, so a
+            # Same token set as cast_data_type()'s boolean branch, so a
             # value that cast-to-boolean would accept never gets rejected
             # by a cell edit.
             parsed = _parse_bool(value)
@@ -383,6 +493,20 @@ def change_cell_value(
 
             value = parsed
 
+    if isinstance(value, (list, dict, set, tuple)):
+        # The typed branches above already reject collections (a list cannot
+        # parse as an int, float, bool, or datetime), but the fall-through
+        # branch for string/object columns has no conversion step: assigning
+        # a list or dict into an object-dtype cell succeeds silently, while
+        # the same edit on a StringDtype column raises below. A mixed-type
+        # column (e.g. from a JSON upload whose records disagree on a key's
+        # type) is object dtype, so without this guard a JSON array/object
+        # cell edit is accepted and shown back as a list/dict, yet saves as
+        # its string form on reload — the edit does not round-trip.
+        raise TransformationError(
+            f"Cell value for column '{column_name}' must be a single value, not a {type(value).__name__}."
+        )
+
     try:
         df.iat[row_index, col_index - 1] = value
     except (TypeError, ValueError, OverflowError) as exc:
@@ -412,18 +536,95 @@ def _coerce_fill_value(value):
     return value
 
 
-def _coerce_fill_value_for_column(value, column: pd.Series):
-    """Coerce a fill value to match a column's dtype when applying across all columns.
+def _coerce_custom_fill_value(value, column: pd.Series, column_name: str, *, coerce_strings: bool = True):
+    """Coerce a custom fillEmpty value to the column's dtype, or reject it.
 
-    Only numeric columns attempt int/float coercion; non-numeric columns receive
-    the raw string unchanged. This prevents a single coerced value (e.g. an int)
-    from being applied to a string column when filling every column at once.
+    ``Series.fillna`` accepts almost anything, and the failure modes are both
+    bad: a value that cannot be stored in a nullable dtype (``Int64``,
+    ``boolean``) or a non-scalar value raises a raw ``TypeError`` that the
+    endpoint can only answer with a 500, while a text value in a float or
+    datetime column silently rewrites the column as object dtype, destroying
+    the type for every later operation. A value that cannot live in the
+    column is a client error, and a value that can live there must keep the
+    column's dtype.
+
+    ``coerce_strings`` preserves the two existing call sites' behaviour for
+    untyped columns: a single-column fill coerces numeric strings (as
+    ``_coerce_fill_value`` always did), while an all-columns fill leaves
+    strings untouched in non-numeric columns.
     """
-    if not isinstance(value, str):
-        return value
-    if pd.api.types.is_numeric_dtype(column):
-        return _coerce_fill_value(value)
-    return value
+    if isinstance(value, (list, dict, set, tuple)):
+        raise TransformationError(
+            f"Fill value for column '{column_name}' must be a single value, not a {type(value).__name__}"
+        )
+
+    dtype = column.dtype
+
+    # pandas counts bool as numeric, so check it before the numeric branch.
+    if pd.api.types.is_bool_dtype(dtype):
+        if isinstance(value, bool):
+            return value
+        parsed = _parse_bool(value)
+        if parsed is None:
+            raise TransformationError(
+                f"Cannot fill boolean column '{column_name}' with {value!r}. Expected a boolean value."
+            )
+        return parsed
+
+    if pd.api.types.is_datetime64_any_dtype(dtype):
+        if isinstance(value, (datetime, date)):
+            return pd.Timestamp(value)
+        if isinstance(value, str):
+            try:
+                return pd.to_datetime(value)
+            except (ValueError, TypeError, OverflowError):
+                pass
+        raise TransformationError(f"Cannot fill datetime column '{column_name}' with {value!r}. Expected a date value.")
+
+    if pd.api.types.is_numeric_dtype(dtype):
+        if isinstance(value, bool):
+            raise TransformationError(f"Cannot fill numeric column '{column_name}' with a boolean value.")
+        coerced = _coerce_fill_value(value)
+        if isinstance(coerced, str):
+            raise TransformationError(f"Cannot fill numeric column '{column_name}' with non-numeric value {value!r}.")
+        if isinstance(coerced, float) and not math.isfinite(coerced):
+            raise TransformationError(f"Cannot fill numeric column '{column_name}' with non-finite value {value!r}.")
+        return coerced
+
+    return _coerce_fill_value(value) if coerce_strings else value
+
+
+def _fillna_custom(series: pd.Series, value, column_name: str, *, coerce_strings: bool = True) -> pd.Series:
+    """Fill a series with a custom value, as a client error on failure.
+
+    The dtype guard above rejects the known un-storable values; this wrap
+    covers whatever pandas still refuses (e.g. a naive date into a
+    timezone-aware datetime column) so it surfaces as a 400, never a 500.
+    """
+    try:
+        return series.fillna(_coerce_custom_fill_value(value, series, column_name, coerce_strings=coerce_strings))
+    except TransformationError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise TransformationError(f"Cannot fill column '{column_name}' with {value!r}: {exc}") from exc
+
+
+def _is_non_numeric_for_statistics(series: pd.Series) -> bool:
+    """True when a column must not feed the mean/median fill strategies.
+
+    The mean/median branches reject a column only when ``pd.to_numeric``
+    coerces all of its values to NaN, but that guard lets datetimes and
+    booleans through: ``to_numeric`` converts datetimes to nanosecond
+    integers and booleans to 0/1 instead of NaN, so a datetime column
+    would be filled with a raw nanosecond count and a boolean column
+    with 0.5. Object columns of plain Python bools (e.g. a CSV boolean
+    column with a missing value, which pandas reads as object dtype)
+    need the same rejection.
+    """
+    if pd.api.types.is_datetime64_any_dtype(series) or pd.api.types.is_bool_dtype(series):
+        return True
+    non_null = series.dropna()
+    return len(non_null) > 0 and all(isinstance(v, bool) for v in non_null)
 
 
 def fill_empty(
@@ -461,9 +662,12 @@ def fill_empty(
         series = df[column_name]
 
         if strategy == "custom":
-            df[column_name] = series.fillna(_coerce_fill_value(fill_value))
+            df[column_name] = _fillna_custom(series, fill_value, column_name)
 
         elif strategy == "mean":
+            if _is_non_numeric_for_statistics(series):
+                raise TransformationError(f"Cannot compute mean on non-numeric column '{column_name}'")
+
             numeric_series = pd.to_numeric(series, errors="coerce")
             if numeric_series.dropna().empty:
                 raise TransformationError(f"Cannot compute mean on non-numeric column '{column_name}'")
@@ -476,6 +680,9 @@ def fill_empty(
             df[column_name] = series.fillna(computed_fill_value)
 
         elif strategy == "median":
+            if _is_non_numeric_for_statistics(series):
+                raise TransformationError(f"Cannot compute median on non-numeric column '{column_name}'")
+
             numeric_series = pd.to_numeric(series, errors="coerce")
             if numeric_series.dropna().empty:
                 raise TransformationError(f"Cannot compute median on non-numeric column '{column_name}'")
@@ -505,7 +712,16 @@ def fill_empty(
         return df
 
     if strategy == "custom":
-        return df.apply(lambda col: col.fillna(_coerce_fill_value_for_column(fill_value, col)))
+        # A column with nothing to fill is a no-op, so it is returned
+        # unchanged without validating the fill value against it: a text
+        # fill over all columns must not be rejected by a complete
+        # numeric, boolean or datetime column that fillna would never
+        # touch. Only columns that actually have nulls are validated.
+        return df.apply(
+            lambda col: (
+                col if not col.isna().any() else _fillna_custom(col, fill_value, str(col.name), coerce_strings=False)
+            ),
+        )
 
     if strategy == "ffill":
         return df.ffill()
@@ -565,25 +781,71 @@ def cast_data_type(df: pd.DataFrame, column: str, target_type: str) -> pd.DataFr
 
     df = df.copy()
     try:
+        # Casting between numeric and datetime dtypes silently reinterprets
+        # the values instead of converting them: pandas reads numbers as
+        # nanoseconds since 1970-01-01 (a year column becomes 1970-01-01)
+        # and dates as nanosecond counts (2024-01-01 becomes
+        # 1704067200000000). There is no unit parameter, so neither
+        # direction has a correct result — refuse instead of returning
+        # nonsense.
+        if target_type == "datetime" and pd.api.types.is_numeric_dtype(df[column]):
+            raise TransformationError(
+                f"Cannot cast numeric column '{column}' to datetime: "
+                "numbers would be read as nanoseconds since 1970-01-01"
+            )
+        if target_type in ("integer", "float") and pd.api.types.is_datetime64_any_dtype(df[column]):
+            raise TransformationError(
+                f"Cannot cast datetime column '{column}' to {target_type}: "
+                "dates would become nanosecond counts since 1970-01-01"
+            )
+
         if target_type == "string":
             df[column] = df[column].astype(str)
         elif target_type in ("integer", "float"):
-            df[column] = pd.to_numeric(df[column], errors="coerce")
-            if target_type == "integer":
-                # Use pandas' nullable Int64 so NaNs from coerced values coexist with ints.
-                df[column] = df[column].astype("Int64")
-            else:
-                df[column] = df[column].astype(float)
-        elif target_type == "boolean":
-            truthy = {"true", "1", "yes", "y", "on"}
-            falsy = {"false", "0", "no", "n", "off"}
-            df[column] = df[column].apply(
+            coerced = pd.to_numeric(df[column], errors="coerce")
+            # Nulls and blank strings stay null (the same contract as the
+            # boolean and datetime branches); any other value that does not
+            # parse is a client error, not a silent null — casting a text
+            # column to a number used to return 200 with every value wiped.
+            # Strings float() itself accepts ("nan", "inf", ...) parse to
+            # real floats and stay allowed.
+            present = df[column].notna()
+            is_blank_string = df[column].map(lambda v: isinstance(v, str) and v.strip() == "")
+            is_float_literal = df[column].map(
                 lambda v: (
-                    True if str(v).strip().lower() in truthy else (False if str(v).strip().lower() in falsy else None)
+                    isinstance(v, str)
+                    and v.strip().lower()
+                    in {"nan", "+nan", "-nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"}
                 )
             )
+            unparseable = coerced.isna() & present & ~is_blank_string & ~is_float_literal
+            if unparseable.any():
+                first_bad = df[column][unparseable].iloc[0]
+                raise TransformationError(
+                    f"Cannot cast column '{column}' to {target_type}: value {first_bad!r} is not a valid number"
+                )
+            if target_type == "integer":
+                # Use pandas' nullable Int64 so NaNs from nulls/blanks coexist with ints.
+                df[column] = coerced.astype("Int64")
+            else:
+                df[column] = coerced.astype(float)
+        elif target_type == "boolean":
+            df[column] = df[column].apply(lambda v: _cast_to_bool(v, column))
         elif target_type == "datetime":
-            df[column] = pd.to_datetime(df[column], errors="coerce")
+            parsed = pd.to_datetime(df[column], errors="coerce")
+            # Nulls and blank strings stay null (the same contract as the
+            # boolean branch); any other value that does not parse is a
+            # client error, not a silent null — casting a text column to
+            # datetime used to return 200 with every value wiped to NaT.
+            present = df[column].notna()
+            is_blank_string = df[column].map(lambda v: isinstance(v, str) and v.strip() == "")
+            unparseable = parsed.isna() & present & ~is_blank_string
+            if unparseable.any():
+                first_bad = df[column][unparseable].iloc[0]
+                raise TransformationError(
+                    f"Cannot cast column '{column}' to datetime: value {first_bad!r} is not a valid date"
+                )
+            df[column] = parsed
         else:
             raise TransformationError(f"Unsupported target type: {target_type}")
     except TransformationError:
@@ -665,6 +927,277 @@ def standardize_dates(df: pd.DataFrame, column: str, output_format: str) -> pd.D
     df[column] = formatted.where(parsed.notna(), df[column])
 
     return df
+
+
+def handle_outliers(
+    df: pd.DataFrame,
+    column: str,
+    method: str = "iqr",
+    action: str = "clip",
+    sensitivity: float | None = None,
+    lower_percentile: float | None = None,
+    upper_percentile: float | None = None,
+    flag_column: str | None = None,
+) -> pd.DataFrame:
+    """Detect and remediate statistical outliers in a numeric column.
+
+    Supports Tukey's IQR fences, Z-score distance, and percentile bounds,
+    with four remediation actions:
+    - ``clip`` (Winsorization): Clamp extreme values to lower/upper thresholds.
+    - ``drop``: Remove rows containing outlier values.
+    - ``set_null``: Replace outlier values with NaN for downstream imputation.
+    - ``flag``: Append a boolean indicator column (e.g. ``<col>_is_outlier``).
+
+    Args:
+        df: Source DataFrame.
+        column: Column name to evaluate.
+        method: Outlier detection algorithm: 'iqr', 'zscore', or 'percentile'.
+        action: Remediation strategy: 'clip', 'drop', 'set_null', or 'flag'.
+        sensitivity: Fence multiplier for IQR (default 1.5) or |z| threshold (default 3.0).
+        lower_percentile: Lower quantile for percentile method (default 0.01).
+        upper_percentile: Upper quantile for percentile method (default 0.99).
+        flag_column: Custom name for the boolean indicator column when action='flag'.
+
+    Returns:
+        New transformed DataFrame with outliers remediated.
+
+    Raises:
+        TransformationError: If the column is missing, non-numeric, or parameters are invalid.
+    """
+    column_stripped = column.strip()
+    stripped_to_original = {col.strip(): col for col in df.columns}
+    if column_stripped not in stripped_to_original:
+        available = list(df.columns)
+        raise TransformationError(f"Column '{column}' not found. Available columns: {available}")
+    column = stripped_to_original[column_stripped]
+
+    series = df[column]
+    if pd.api.types.is_bool_dtype(series):
+        raise TransformationError(
+            f"Column '{column}' is boolean. Outlier detection requires continuous or discrete numeric data."
+        )
+    if not pd.api.types.is_numeric_dtype(series):
+        numeric_series = pd.to_numeric(series.dropna(), errors="coerce")
+        if numeric_series.isna().any() or numeric_series.empty:
+            raise TransformationError(f"Column '{column}' is not numeric. Outlier detection requires numeric data.")
+        series = pd.to_numeric(series, errors="coerce")
+
+    valid_methods = {"iqr", "zscore", "percentile"}
+    method_str = str(method).lower().strip()
+    if method_str not in valid_methods:
+        raise TransformationError(f"Unknown outlier method: '{method}'. Supported methods: {sorted(valid_methods)}")
+
+    valid_actions = {"clip", "drop", "set_null", "flag"}
+    action_str = str(action).lower().strip()
+    if action_str not in valid_actions:
+        raise TransformationError(f"Unknown outlier action: '{action}'. Supported actions: {sorted(valid_actions)}")
+
+    flag_col = None
+    if action_str == "flag":
+        flag_col = flag_column.strip() if flag_column and flag_column.strip() else f"{column}_is_outlier"
+        if flag_col in stripped_to_original:
+            raise TransformationError(
+                f"Flag column '{flag_col}' already exists in DataFrame. Please specify a different flag_column name."
+            )
+
+    non_null = series.dropna()
+    if len(non_null) < 4:
+        logger.warning(
+            "Column '%s' has fewer than 4 non-null values (%d); skipping outlier detection.", column, len(non_null)
+        )
+        result_df = df.copy()
+        if not pd.api.types.is_numeric_dtype(df[column]):
+            result_df[column] = series
+        if action_str == "flag" and flag_col is not None:
+            result_df[flag_col] = False
+        return result_df
+
+    if method_str == "iqr":
+        k = 1.5 if sensitivity is None else float(sensitivity)
+        if k <= 0:
+            raise TransformationError("Sensitivity multiplier for IQR method must be positive.")
+        q1 = float(non_null.quantile(0.25))
+        q3 = float(non_null.quantile(0.75))
+        iqr = q3 - q1
+        lower_bound = q1 - k * iqr
+        upper_bound = q3 + k * iqr
+        outlier_mask = (series < lower_bound) | (series > upper_bound)
+
+    elif method_str == "zscore":
+        thresh = 3.0 if sensitivity is None else float(sensitivity)
+        if thresh <= 0:
+            raise TransformationError("Sensitivity threshold for Z-score method must be positive.")
+        mean = float(non_null.mean())
+        std = float(non_null.std(ddof=0))
+        if std == 0 or math.isclose(std, 0.0, abs_tol=1e-8):
+            outlier_mask = pd.Series(False, index=series.index)
+            lower_bound = None
+            upper_bound = None
+        else:
+            lower_bound = mean - thresh * std
+            upper_bound = mean + thresh * std
+            outlier_mask = ((series - mean) / std).abs() > thresh
+
+    elif method_str == "percentile":
+        low_p = 0.01 if lower_percentile is None else float(lower_percentile)
+        high_p = 0.99 if upper_percentile is None else float(upper_percentile)
+        if not (0.0 <= low_p < high_p <= 1.0):
+            raise TransformationError(
+                f"Invalid percentiles: lower ({low_p}) must be less than upper ({high_p}), both in [0, 1]."
+            )
+        lower_bound = float(non_null.quantile(low_p))
+        upper_bound = float(non_null.quantile(high_p))
+        outlier_mask = (series < lower_bound) | (series > upper_bound)
+
+    outlier_mask = outlier_mask.fillna(False)
+    result_df = df.copy()
+    if not pd.api.types.is_numeric_dtype(df[column]):
+        result_df[column] = series
+
+    if action_str == "clip":
+        if lower_bound is not None and upper_bound is not None:
+            result_df[column] = series.clip(lower=lower_bound, upper=upper_bound)
+
+    elif action_str == "drop":
+        result_df = result_df[~outlier_mask].reset_index(drop=True)
+
+    elif action_str == "set_null":
+        if outlier_mask.any():
+            col_dtype = result_df[column].dtype
+            if isinstance(col_dtype, pd.api.extensions.ExtensionDtype) and pd.api.types.is_integer_dtype(col_dtype):
+                result_df.loc[outlier_mask, column] = pd.NA
+            else:
+                if pd.api.types.is_integer_dtype(result_df[column]):
+                    result_df[column] = result_df[column].astype(float)
+                result_df.loc[outlier_mask, column] = float("nan")
+
+    elif action_str == "flag":
+        result_df[flag_col] = outlier_mask
+
+    return result_df
+
+
+def scale_numeric(
+    df: pd.DataFrame,
+    column: str,
+    method: str = "minmax",
+    target_min: float = 0.0,
+    target_max: float = 1.0,
+    output_column: str | None = None,
+) -> pd.DataFrame:
+    """Scale and normalize values in a numeric column.
+
+    Supports four statistical scaling techniques:
+    - ``minmax``: Linearly project values into ``[target_min, target_max]``.
+    - ``standard``: Standardize to zero mean and unit variance (Z-score).
+    - ``robust``: Center by median and scale by Interquartile Range (IQR).
+    - ``maxabs``: Scale by the maximum absolute value into ``[-1, 1]``.
+
+    Args:
+        df: Source DataFrame.
+        column: Column name to scale.
+        method: Scaling algorithm: 'minmax', 'standard', 'robust', or 'maxabs'.
+        target_min: Lower bound for 'minmax' scaling (default 0.0).
+        target_max: Upper bound for 'minmax' scaling (default 1.0).
+        output_column: Optional name for a new destination column. If omitted,
+            the transformation overwrites the source column in-place.
+
+    Returns:
+        New DataFrame with scaled values.
+
+    Raises:
+        TransformationError: If the column is missing, non-numeric, boolean,
+            parameters are invalid, or output_column collides with existing columns.
+    """
+    column_stripped = column.strip()
+    stripped_to_original = {col.strip(): col for col in df.columns}
+    if column_stripped not in stripped_to_original:
+        available = list(df.columns)
+        raise TransformationError(f"Column '{column}' not found. Available columns: {available}")
+    column = stripped_to_original[column_stripped]
+
+    series = df[column]
+    if pd.api.types.is_bool_dtype(series):
+        raise TransformationError(
+            f"Column '{column}' is boolean. Feature scaling requires continuous or discrete numeric data."
+        )
+    if not pd.api.types.is_numeric_dtype(series):
+        non_null_raw = series.dropna()
+        if not non_null_raw.empty:
+            numeric_series = pd.to_numeric(non_null_raw, errors="coerce")
+            if numeric_series.isna().any():
+                raise TransformationError(f"Column '{column}' is not numeric. Feature scaling requires numeric data.")
+        series = pd.to_numeric(series, errors="coerce")
+
+    valid_methods = {"minmax", "standard", "robust", "maxabs"}
+    method_str = str(method).lower().strip()
+    if method_str not in valid_methods:
+        raise TransformationError(f"Unknown scaling method: '{method}'. Supported methods: {sorted(valid_methods)}")
+
+    if method_str == "minmax" and target_min >= target_max:
+        raise TransformationError(f"target_min ({target_min}) must be strictly less than target_max ({target_max}).")
+
+    target_col = column
+    if output_column is not None:
+        out_col_clean = output_column.strip()
+        if not out_col_clean:
+            raise TransformationError("output_column must not be empty or whitespace only.")
+        if out_col_clean in stripped_to_original and out_col_clean != column_stripped:
+            raise TransformationError(
+                f"Output column '{out_col_clean}' already exists in DataFrame. Please specify a distinct output_column."
+            )
+        target_col = column if out_col_clean == column_stripped else out_col_clean
+
+    non_null = series.dropna()
+    result_df = df.copy()
+
+    if non_null.empty:
+        if target_col != column:
+            result_df[target_col] = pd.Series(float("nan"), index=df.index, dtype=float)
+        else:
+            result_df[target_col] = result_df[target_col].astype(float)
+        return result_df
+
+    if method_str == "minmax":
+        min_val = float(non_null.min())
+        max_val = float(non_null.max())
+        diff = max_val - min_val
+        if diff == 0 or math.isclose(diff, 0.0, abs_tol=1e-8):
+            scaled_series = pd.Series(target_min, index=series.index, dtype=float)
+            scaled_series[series.isna()] = float("nan")
+        else:
+            scaled_series = (series - min_val) / diff * (target_max - target_min) + target_min
+
+    elif method_str == "standard":
+        mean_val = float(non_null.mean())
+        std_val = float(non_null.std(ddof=0))
+        if std_val == 0 or math.isclose(std_val, 0.0, abs_tol=1e-8):
+            scaled_series = pd.Series(0.0, index=series.index, dtype=float)
+            scaled_series[series.isna()] = float("nan")
+        else:
+            scaled_series = (series - mean_val) / std_val
+
+    elif method_str == "robust":
+        median_val = float(non_null.median())
+        q1 = float(non_null.quantile(0.25))
+        q3 = float(non_null.quantile(0.75))
+        iqr = q3 - q1
+        if iqr == 0 or math.isclose(iqr, 0.0, abs_tol=1e-8):
+            scaled_series = pd.Series(0.0, index=series.index, dtype=float)
+            scaled_series[series.isna()] = float("nan")
+        else:
+            scaled_series = (series - median_val) / iqr
+
+    elif method_str == "maxabs":
+        max_abs = float(non_null.abs().max())
+        if max_abs == 0 or math.isclose(max_abs, 0.0, abs_tol=1e-8):
+            scaled_series = pd.Series(0.0, index=series.index, dtype=float)
+            scaled_series[series.isna()] = float("nan")
+        else:
+            scaled_series = series / max_abs
+
+    result_df[target_col] = scaled_series.astype(float)
+    return result_df
 
 
 def string_replace(df: pd.DataFrame, column: str, find_value: str, replace_value: str) -> pd.DataFrame:
@@ -927,6 +1460,20 @@ def group_by(df: pd.DataFrame, columns: list[str], agg_column: str, agg_function
             f"Unsupported aggregation function: '{agg_function_str}'. Supported: {sorted(SUPPORTED_AGG_FUNCTIONS)}"
         )
 
+    if agg_function_str == "sum":
+        # pandas silently concatenates strings for sum, so summing a text
+        # column used to return joined values ("AliceBob") instead of an
+        # error. Mean and median already fail loudly on text via pandas;
+        # reject sum explicitly so the user gets a clear 400 instead.
+        # Object-dtype columns holding numbers (e.g. from a mixed-type
+        # upload) still sum normally, so only actual string values trip this.
+        non_null = df[agg_column].dropna()
+        if len(non_null) and non_null.map(lambda v: isinstance(v, str)).any():
+            raise TransformationError(
+                f"Cannot sum text column '{agg_column}': 'sum' concatenates text "
+                "instead of adding numbers. Cast the column to a numeric type first."
+            )
+
     try:
         result = df.groupby(columns, as_index=False)[agg_column].agg(agg_function_str)
     except (TypeError, ValueError) as exc:
@@ -1038,6 +1585,40 @@ def apply_add_file(df: pd.DataFrame, file_path: str) -> pd.DataFrame:
         logger.warning("Could not read stored file for addFile replay: %s", file_path)
         raise TransformationError("Stored file for this append is missing or unreadable") from e
     return append_dataframes(df, new_df)
+
+
+def apply_merge_dataset(
+    df: pd.DataFrame,
+    file_path: str | None = None,
+    left_on: list[str] | str | None = None,
+    right_on: list[str] | str | None = None,
+    how: str = "inner",
+    suffixes: list[str] | tuple[str, str] = ("_left", "_right"),
+) -> pd.DataFrame:
+    """Replay a mergeDataset transformation from an immutable stored file.
+
+    Args:
+        df: Source DataFrame.
+        file_path: Path to the stored lookup file.
+        left_on: Left key column(s).
+        right_on: Right key column(s).
+        how: Relational join type.
+        suffixes: Overlapping column suffixes.
+
+    Returns:
+        The merged DataFrame with normalized columns and index.
+    """
+    if not file_path:
+        logger.warning("No file_path recorded for mergeDataset replay; returning DataFrame unchanged.")
+        return df
+    try:
+        right_df = read_table_safe(Path(file_path))
+    except Exception as e:
+        logger.warning("Could not read stored file for mergeDataset replay: %s", file_path)
+        raise TransformationError("Stored file for this merge is missing or unreadable") from e
+    from app.services.merge_service import merge_dataframes
+
+    return merge_dataframes(df, right_df, left_on=left_on, right_on=right_on, how=how, suffixes=tuple(suffixes))
 
 
 @dataclass(frozen=True)
@@ -1283,6 +1864,50 @@ TRANSFORMATION_REGISTRY: dict[OperationType, TransformationSpec] = {
             d["standardize_dates_params"]["column"],
             d["standardize_dates_params"]["output_format"],
         ),
+    ),
+    OperationType.mergeDataset: TransformationSpec(
+        func="apply_merge_dataset",
+        label="Merge dataset",
+        params_field="merge_params",
+        missing_error="Merge dataset operations must use the /merge endpoint",
+        build_args=lambda d: (
+            (d.get("merge_params") or d).get("file_path"),
+            (d.get("merge_params") or d).get("left_on"),
+            (d.get("merge_params") or d).get("right_on"),
+            (d.get("merge_params") or d).get("how", "inner"),
+            (d.get("merge_params") or d).get("suffixes", ("_left", "_right")),
+        ),
+        reusable=False,
+    ),
+    OperationType.handleOutliers: TransformationSpec(
+        func="handle_outliers",
+        label="Handle outliers",
+        params_field="outlier_params",
+        missing_error="Outlier parameters required",
+        build_args=lambda d: (
+            d["outlier_params"]["column"],
+            d["outlier_params"].get("method", "iqr"),
+            d["outlier_params"].get("action", "clip"),
+            d["outlier_params"].get("sensitivity"),
+            d["outlier_params"].get("lower_percentile"),
+            d["outlier_params"].get("upper_percentile"),
+            d["outlier_params"].get("flag_column"),
+        ),
+        reusable=True,
+    ),
+    OperationType.scaleNumeric: TransformationSpec(
+        func="scale_numeric",
+        label="Scale numeric features",
+        params_field="scale_numeric_params",
+        missing_error="Scale numeric parameters required",
+        build_args=lambda d: (
+            d["scale_numeric_params"]["column"],
+            d["scale_numeric_params"].get("method", "minmax"),
+            d["scale_numeric_params"].get("target_min", 0.0),
+            d["scale_numeric_params"].get("target_max", 1.0),
+            d["scale_numeric_params"].get("output_column"),
+        ),
+        reusable=True,
     ),
 }
 

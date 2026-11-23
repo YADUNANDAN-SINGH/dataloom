@@ -19,6 +19,7 @@ from app.services.transformation_service import (
     drop_duplicates,
     drop_na,
     fill_empty,
+    get_column_type,
     pivot_table,
     rename_column,
     standardize_dates,
@@ -70,6 +71,26 @@ class TestFilter:
         with pytest.raises(TransformationError, match="Invalid boolean value"):
             apply_filter(df, "active", "=", "maybe")
 
+    def test_filter_numeric_nan_equals_raises(self):
+        # NaN never equals anything, not even itself, so "=" would silently
+        # return no rows even when the column holds NaN values.
+        df = pd.DataFrame({"qty": [1.0, float("nan"), 3.0]})
+        with pytest.raises(TransformationError, match="Invalid numeric value"):
+            apply_filter(df, "qty", "=", "nan")
+
+    def test_filter_numeric_nan_not_equals_raises(self):
+        # "!=" has the mirror-image lie: it returns every row, NaN ones included.
+        df = pd.DataFrame({"qty": [1.0, float("nan"), 3.0]})
+        with pytest.raises(TransformationError, match="Invalid numeric value"):
+            apply_filter(df, "qty", "!=", "nan")
+
+    def test_filter_numeric_inf_still_compares(self):
+        # Infinity is a well-defined comparison value, so it stays allowed.
+        df = pd.DataFrame({"qty": [1.0, float("inf"), 3.0]})
+        result = apply_filter(df, "qty", "=", "inf")
+        assert len(result) == 1
+        assert result.iloc[0]["qty"] == float("inf")
+
     def test_filter_greater_than_numeric(self, sample_df):
         result = apply_filter(sample_df, "age", ">", "28")
         assert len(result) == 2
@@ -110,6 +131,22 @@ class TestFilter:
         with pytest.raises(TransformationError, match="Unsupported"):
             apply_filter(sample_df, "name", "invalid", "Alice")
 
+    def test_filter_invalid_datetime_value(self):
+        df = pd.DataFrame({"when": pd.to_datetime(["2024-01-01", "2024-02-01"])})
+        with pytest.raises(TransformationError, match="Invalid datetime value"):
+            apply_filter(df, "when", ">", "not-a-date")
+
+    def test_filter_valid_datetime_value_still_filters(self):
+        df = pd.DataFrame({"when": pd.to_datetime(["2024-01-01", "2024-02-01"])})
+        result = apply_filter(df, "when", ">", "2024-01-15")
+        assert len(result) == 1
+        assert str(result.iloc[0]["when"]) == "2024-02-01 00:00:00"
+
+    def test_filter_mixed_type_column_ordering_is_client_error(self):
+        df = pd.DataFrame({"a": [1, "two", 3.0]})
+        with pytest.raises(TransformationError, match="Cannot apply filter condition"):
+            apply_filter(df, "a", ">", "2")
+
 
 class TestSort:
     def test_sort_ascending(self, sample_df):
@@ -123,6 +160,20 @@ class TestSort:
     def test_sort_invalid_column(self, sample_df):
         with pytest.raises(TransformationError):
             apply_sort(sample_df, "nonexistent", True)
+
+    def test_sort_mixed_type_column(self):
+        """A column holding mixed Python types — e.g. from a JSON upload whose
+        records disagree on a key's type — cannot be compared element-wise.
+        Sorting it must fail as a TransformationError, not as a raw TypeError
+        that the endpoint can only answer with a 500."""
+        df = pd.DataFrame({"v": [1, "x", 2.5], "name": ["a", "b", "c"]})
+        with pytest.raises(TransformationError, match="mixed types"):
+            apply_sort(df, "v", True)
+
+    def test_sort_mixed_type_column_via_criteria(self):
+        df = pd.DataFrame({"v": [1, "x", 2.5], "name": ["a", "b", "c"]})
+        with pytest.raises(TransformationError, match="mixed types"):
+            apply_sort(df, criteria=[{"column": "v", "ascending": True}])
 
     def test_multi_column_sort(self, sample_df):
         """Multi-column sort should sort by multiple criteria in order."""
@@ -157,7 +208,7 @@ class TestAddRow:
     def test_add_row_at_beginning(self, sample_df):
         result = add_row(sample_df, 0)
         assert len(result) == 4
-        assert result.iloc[0]["name"] == " "
+        assert result.iloc[0].isna().all()
 
     def test_add_row_at_end(self, sample_df):
         result = add_row(sample_df, 3)
@@ -166,6 +217,31 @@ class TestAddRow:
     def test_add_row_out_of_range(self, sample_df):
         with pytest.raises(TransformationError):
             add_row(sample_df, -1)
+
+    def test_add_row_keeps_numeric_columns_numeric(self, sample_df):
+        """A blank row must not turn numeric columns into text (#649)."""
+        result = add_row(sample_df, 1)
+        assert pd.api.types.is_integer_dtype(result["age"])
+        assert result["age"][0] == 30
+        assert pd.isna(result["age"][1])
+
+        floats = add_row(pd.DataFrame({"price": [1.5, 2.5]}), 1)
+        assert floats["price"].dtype == float
+
+    def test_add_row_keeps_boolean_columns_boolean(self):
+        """A blank row must not turn a bool column into object dtype."""
+        df = pd.DataFrame({"active": [True, False]})
+        result = add_row(df, 1)
+        assert get_column_type(result, "active") == "boolean"
+        assert result["active"][0]
+        assert pd.isna(result["active"][1])
+        assert not result["active"][2]
+
+    def test_add_row_then_sort_and_filter_numeric_column(self, sample_df):
+        """Sort and filter on a numeric column still work after adding a row (#649)."""
+        result = add_row(sample_df, 1)
+        assert apply_sort(result, "age")["age"].dropna().tolist() == [25, 30, 35]
+        assert apply_filter(result, "age", ">", "28")["age"].tolist() == [30, 35]
 
 
 class TestDeleteRow:
@@ -255,6 +331,18 @@ class TestDeleteColumn:
     def test_delete_column_out_of_range(self, sample_df):
         with pytest.raises(TransformationError):
             delete_column(sample_df, 10)
+
+    def test_delete_last_column_raises(self):
+        # A zero-column frame cannot be saved and re-read (an empty CSV has
+        # no columns to parse), so deleting the only column must be refused.
+        df = pd.DataFrame({"only": [1, 2, 3]})
+        with pytest.raises(TransformationError, match="only remaining column"):
+            delete_column(df, 0)
+
+    def test_delete_column_from_two_columns_works(self):
+        df = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+        result = delete_column(df, 0)
+        assert result.columns.tolist() == ["b"]
 
 
 class TestChangeCellValue:
@@ -357,6 +445,31 @@ class TestChangeCellValue:
             match="Expected an integer or decimal value",
         ):
             change_cell_value(sample_df, 0, 2, "hello")
+
+    def test_int_cell_value_above_int64_max_raises(self, sample_df):
+        # 2**63 does not fit int64: assigning it made pandas raise an
+        # uncaught AssertionError (HTTP 500) instead of a client error.
+        with pytest.raises(TransformationError, match="out of range"):
+            change_cell_value(sample_df, 0, 2, 2**63)
+
+    def test_int_cell_value_above_int64_max_as_string_raises(self, sample_df):
+        # The frontend sends cell values as strings, so the same overflow
+        # must be rejected in string form too.
+        with pytest.raises(TransformationError, match="out of range"):
+            change_cell_value(sample_df, 0, 2, "9223372036854775808")
+
+    def test_int_cell_value_below_int64_min_raises(self, sample_df):
+        with pytest.raises(TransformationError, match="out of range"):
+            change_cell_value(sample_df, 0, 2, -(2**63) - 1)
+
+    def test_int_cell_value_at_int64_bounds_accepted(self, sample_df):
+        result = change_cell_value(sample_df, 0, 2, 2**63 - 1)
+        assert result.iloc[0]["age"] == 2**63 - 1
+        assert pd.api.types.is_integer_dtype(result["age"].dtype)
+
+        result = change_cell_value(sample_df, 0, 2, -(2**63))
+        assert result.iloc[0]["age"] == -(2**63)
+        assert pd.api.types.is_integer_dtype(result["age"].dtype)
 
     def test_invalid_int_edit_does_not_modify_original_dataframe(
         self,
@@ -528,6 +641,24 @@ class TestChangeCellValue:
         assert result.at[1, "value"] == pytest.approx(10.5)
         assert result["value"].dtype == object
 
+    def test_non_scalar_value_on_object_column_raises(self):
+        # A mixed-type column (e.g. from a JSON upload whose records disagree
+        # on a key's type) is object dtype, and assigning a list or dict into
+        # an object cell succeeds silently — while the same edit on a
+        # StringDtype column raises. The stored value then serializes as its
+        # string form on reload, so the edit does not round-trip.
+        df = pd.DataFrame({"m": pd.Series([1, "two", 3], dtype=object), "v": [10, 20, 30]})
+        for value in (["x"], {"k": 1}):
+            with pytest.raises(TransformationError, match="single value"):
+                change_cell_value(df, 0, 1, value)
+
+    def test_single_element_list_on_string_column_raises(self):
+        # pandas unwraps a one-element list when assigning into a StringDtype
+        # cell, so ["x"] used to succeed as "x" while ["x", "y"] raised.
+        df = pd.DataFrame({"name": pd.array(["a", "b"], dtype="string")})
+        with pytest.raises(TransformationError, match="single value"):
+            change_cell_value(df, 0, 1, ["x"])
+
     def test_change_cell_uses_position_after_sort(self):
         df = pd.DataFrame(
             {
@@ -561,6 +692,80 @@ class TestFillEmpty:
         df = pd.DataFrame({"a": [1, None, 3]})
         with pytest.raises(TransformationError, match="fill value is required"):
             fill_empty(df, strategy="custom")
+
+    def test_fill_custom_text_on_numeric_column_raises(self):
+        # A text fill in a float column used to succeed and silently rewrite
+        # the column as object dtype ([1.0, "abc", 3.0]); it is a client error.
+        df = pd.DataFrame({"score": [1.0, None, 3.0]})
+        with pytest.raises(TransformationError, match="non-numeric"):
+            fill_empty(df, fill_value="abc", column_index=0, strategy="custom")
+
+    def test_fill_custom_numeric_string_on_numeric_column_still_fills(self):
+        df = pd.DataFrame({"score": [1.0, None, 3.0]})
+        result = fill_empty(df, fill_value="5", column_index=0, strategy="custom")
+        assert result["score"].tolist() == [1.0, 5.0, 3.0]
+        assert pd.api.types.is_float_dtype(result["score"])
+
+    def test_fill_custom_text_on_int64_column_raises(self):
+        # A nullable Int64 column (as produced by casting to integer) raised a
+        # raw TypeError from fillna; it must surface as a TransformationError.
+        df = pd.DataFrame({"n": pd.array([1, None, 3], dtype="Int64")})
+        with pytest.raises(TransformationError, match="non-numeric"):
+            fill_empty(df, fill_value="abc", column_index=0, strategy="custom")
+
+    def test_fill_custom_numeric_string_on_int64_column_preserves_dtype(self):
+        df = pd.DataFrame({"n": pd.array([1, None, 3], dtype="Int64")})
+        result = fill_empty(df, fill_value="5", column_index=0, strategy="custom")
+        assert result["n"].tolist() == [1, 5, 3]
+        assert str(result["n"].dtype) == "Int64"
+
+    def test_fill_custom_bool_token_on_boolean_column(self):
+        df = pd.DataFrame({"flag": pd.array([True, None, False], dtype="boolean")})
+        result = fill_empty(df, fill_value="false", column_index=0, strategy="custom")
+        assert result["flag"].tolist() == [True, False, False]
+        assert str(result["flag"].dtype) == "boolean"
+
+    def test_fill_custom_text_on_boolean_column_raises(self):
+        df = pd.DataFrame({"flag": pd.array([True, None, False], dtype="boolean")})
+        with pytest.raises(TransformationError, match="boolean"):
+            fill_empty(df, fill_value="5", column_index=0, strategy="custom")
+
+    def test_fill_custom_date_string_on_datetime_column_preserves_dtype(self):
+        df = pd.DataFrame({"when": pd.to_datetime(["2024-01-01", None, "2024-01-03"])})
+        result = fill_empty(df, fill_value="2024-02-01", column_index=0, strategy="custom")
+        assert result["when"].iloc[1] == pd.Timestamp("2024-02-01")
+        assert pd.api.types.is_datetime64_any_dtype(result["when"])
+
+    def test_fill_custom_text_on_datetime_column_raises(self):
+        df = pd.DataFrame({"when": pd.to_datetime(["2024-01-01", None, "2024-01-03"])})
+        with pytest.raises(TransformationError, match="date value"):
+            fill_empty(df, fill_value="abc", column_index=0, strategy="custom")
+
+    def test_fill_custom_list_value_raises(self):
+        # fillna() requires a scalar; a JSON array fill value raised a raw
+        # TypeError (HTTP 500) instead of a client error.
+        df = pd.DataFrame({"s": ["a", None, "c"]})
+        with pytest.raises(TransformationError, match="single value"):
+            fill_empty(df, fill_value=["x"], column_index=0, strategy="custom")
+
+    def test_fill_custom_all_columns_rejects_for_typed_column(self):
+        # The all-columns path must apply the same per-column guard: a text
+        # fill over a frame holding a numeric column is rejected, not applied
+        # to the string columns while corrupting the numeric one.
+        df = pd.DataFrame({"score": [1.0, None], "s": ["a", None]})
+        with pytest.raises(TransformationError, match="non-numeric"):
+            fill_empty(df, fill_value="abc", strategy="custom")
+
+    def test_fill_custom_all_columns_skips_columns_without_nulls(self):
+        # A text fill over all columns must not be rejected by a complete
+        # numeric column: fillna on a column with nothing to fill is a
+        # no-op, so only the string column with nulls is filled and the
+        # numeric column comes back untouched, dtype included.
+        df = pd.DataFrame({"score": [1.0, 2.0], "s": ["a", None]})
+        result = fill_empty(df, fill_value="N/A", strategy="custom")
+        assert result["score"].tolist() == [1.0, 2.0]
+        assert pd.api.types.is_float_dtype(result["score"])
+        assert result["s"].tolist() == ["a", "N/A"]
 
     def test_fill_mean_for_numeric_column(self):
         # Mean strategy fills NaN with the numeric column average: (10 + 30) / 2 = 20.
@@ -621,6 +826,38 @@ class TestFillEmpty:
         df = pd.DataFrame({"name": ["Alice", None, "Bob"]})
         with pytest.raises(TransformationError, match="Cannot compute median on non-numeric column"):
             fill_empty(df, column_index=0, strategy="median")
+
+    def test_fill_mean_datetime_column_raises(self):
+        # Datetime columns slip through the old to_numeric guard: pandas
+        # converts datetimes to nanosecond integers instead of NaN, so the
+        # "mean" was a raw nanosecond count written back into a date column.
+        df = pd.DataFrame({"when": pd.to_datetime(["2024-01-01", None, "2024-01-03"])})
+        with pytest.raises(TransformationError, match="Cannot compute mean on non-numeric column"):
+            fill_empty(df, column_index=0, strategy="mean")
+
+    def test_fill_median_datetime_column_raises(self):
+        df = pd.DataFrame({"when": pd.to_datetime(["2024-01-01", None, "2024-01-03"])})
+        with pytest.raises(TransformationError, match="Cannot compute median on non-numeric column"):
+            fill_empty(df, column_index=0, strategy="median")
+
+    def test_fill_mean_boolean_column_raises(self):
+        # Booleans convert to 0/1 under to_numeric, so a boolean column
+        # would otherwise be filled with 0.5 — not a boolean at all.
+        df = pd.DataFrame({"flag": pd.array([True, None, False], dtype="boolean")})
+        with pytest.raises(TransformationError, match="Cannot compute mean on non-numeric column"):
+            fill_empty(df, column_index=0, strategy="mean")
+        df = pd.DataFrame({"flag": [True, None, False]})
+        with pytest.raises(TransformationError, match="Cannot compute mean on non-numeric column"):
+            fill_empty(df, column_index=0, strategy="mean")
+        with pytest.raises(TransformationError, match="Cannot compute median on non-numeric column"):
+            fill_empty(df, column_index=0, strategy="median")
+
+    def test_fill_mode_datetime_column_still_works(self):
+        # Only the numeric statistics are rejected: mode on a datetime
+        # column fills a real date and must keep working.
+        df = pd.DataFrame({"when": pd.to_datetime(["2024-01-01", None, "2024-01-01"])})
+        result = fill_empty(df, column_index=0, strategy="mode")
+        assert result["when"].tolist() == list(pd.to_datetime(["2024-01-01", "2024-01-01", "2024-01-01"]))
 
     def test_fill_statistical_strategy_requires_specific_column(self):
         # Statistical strategies need one selected column so the computed value is unambiguous.
@@ -967,14 +1204,42 @@ class TestCastDataType:
         assert result["age"].iloc[1] == "25"
 
     def test_cast_to_integer(self):
-        df = pd.DataFrame({"val": ["1", "2", "bad", None]})
+        df = pd.DataFrame({"val": ["1", "2", None]})
         result = cast_data_type(df, "val", "integer")
         assert result["val"].iloc[0] == 1
-        assert pd.isna(result["val"].iloc[2])  # coerced NaN
-        assert pd.isna(result["val"].iloc[3])  # coerced NaN
+        assert pd.isna(result["val"].iloc[2])  # null stays null
+
+    def test_cast_to_integer_rejects_unparseable_values(self):
+        df = pd.DataFrame({"city": ["Paris", "London"]})
+        with pytest.raises(TransformationError, match="not a valid number"):
+            cast_data_type(df, "city", "integer")
+
+    def test_cast_to_integer_rejects_mixed_parseable_and_garbage(self):
+        df = pd.DataFrame({"val": ["1", "bad"]})
+        with pytest.raises(TransformationError, match="not a valid number"):
+            cast_data_type(df, "val", "integer")
+
+    def test_cast_to_float_rejects_unparseable_values(self):
+        df = pd.DataFrame({"city": ["Paris", "London"]})
+        with pytest.raises(TransformationError, match="not a valid number"):
+            cast_data_type(df, "city", "float")
+
+    def test_cast_to_numeric_keeps_nulls_and_blanks_null(self):
+        df = pd.DataFrame({"val": ["1", None, ""]})
+        result = cast_data_type(df, "val", "integer")
+        assert result["val"].iloc[0] == 1
+        assert pd.isna(result["val"].iloc[1])
+        assert pd.isna(result["val"].iloc[2])
+
+    def test_cast_to_float_accepts_float_literals(self):
+        df = pd.DataFrame({"val": ["nan", "inf", "3"]})
+        result = cast_data_type(df, "val", "float")
+        assert pd.isna(result["val"].iloc[0])
+        assert result["val"].iloc[1] == float("inf")
+        assert result["val"].iloc[2] == 3.0
 
     def test_cast_to_float(self):
-        df = pd.DataFrame({"val": ["1.5", "2.7", "bad"]})
+        df = pd.DataFrame({"val": ["1.5", "2.7", "3.14"]})
         result = cast_data_type(df, "val", "float")
         assert pd.api.types.is_float_dtype(result["val"])
         assert result["val"].iloc[0] == 1.5
@@ -995,11 +1260,72 @@ class TestCastDataType:
         assert result["flag"].iloc[4]
         assert not result["flag"].iloc[5]
 
+    def test_cast_to_boolean_rejects_unrecognised_values(self):
+        df = pd.DataFrame({"flag": ["maybe", "true"]})
+        with pytest.raises(TransformationError, match="Cannot interpret 'maybe' as boolean"):
+            cast_data_type(df, "flag", "boolean")
+
+    def test_cast_to_boolean_rejects_non_boolean_numbers(self):
+        df = pd.DataFrame({"flag": [2, 0]})
+        with pytest.raises(TransformationError, match="Cannot interpret 2 as boolean"):
+            cast_data_type(df, "flag", "boolean")
+
+    def test_cast_to_boolean_accepts_integral_floats_and_keeps_nulls(self):
+        df = pd.DataFrame({"flag": [1.0, 0.0, None, ""]})
+        result = cast_data_type(df, "flag", "boolean")
+        assert result["flag"].iloc[0] is True
+        assert result["flag"].iloc[1] is False
+        assert result["flag"].iloc[2] is None
+        assert result["flag"].iloc[3] is None
+
     def test_cast_to_datetime(self):
         df = pd.DataFrame({"date": ["2024-01-01", "2024-06-15"]})
         result = cast_data_type(df, "date", "datetime")
         assert pd.api.types.is_datetime64_any_dtype(result["date"])
         assert result["date"].iloc[0] == pd.Timestamp("2024-01-01")
+
+    def test_cast_to_datetime_rejects_unparseable_values(self):
+        df = pd.DataFrame({"city": ["Paris", "London"]})
+        with pytest.raises(TransformationError, match="not a valid date"):
+            cast_data_type(df, "city", "datetime")
+
+    def test_cast_to_datetime_rejects_mixed_parseable_and_garbage(self):
+        df = pd.DataFrame({"date": ["2024-01-01", "garbage"]})
+        with pytest.raises(TransformationError, match="not a valid date"):
+            cast_data_type(df, "date", "datetime")
+
+    def test_cast_to_datetime_keeps_nulls_and_blanks_null(self):
+        df = pd.DataFrame({"date": ["2024-01-01", None, ""]})
+        result = cast_data_type(df, "date", "datetime")
+        assert pd.api.types.is_datetime64_any_dtype(result["date"])
+        assert result["date"].iloc[0] == pd.Timestamp("2024-01-01")
+        assert pd.isna(result["date"].iloc[1])
+        assert pd.isna(result["date"].iloc[2])
+
+    def test_cast_numeric_to_datetime_rejected(self):
+        df = pd.DataFrame({"year": [2024, 2025]})
+        with pytest.raises(TransformationError, match="nanoseconds"):
+            cast_data_type(df, "year", "datetime")
+
+    def test_cast_float_to_datetime_rejected(self):
+        df = pd.DataFrame({"year": [2024.0, 2025.0]})
+        with pytest.raises(TransformationError, match="nanoseconds"):
+            cast_data_type(df, "year", "datetime")
+
+    def test_cast_datetime_to_integer_rejected(self):
+        df = pd.DataFrame({"date": pd.to_datetime(["2024-01-01", "2024-06-15"])})
+        with pytest.raises(TransformationError, match="nanosecond"):
+            cast_data_type(df, "date", "integer")
+
+    def test_cast_datetime_to_float_rejected(self):
+        df = pd.DataFrame({"date": pd.to_datetime(["2024-01-01", "2024-06-15"])})
+        with pytest.raises(TransformationError, match="nanosecond"):
+            cast_data_type(df, "date", "float")
+
+    def test_cast_bool_to_integer_still_allowed(self):
+        df = pd.DataFrame({"flag": [True, False]})
+        result = cast_data_type(df, "flag", "integer")
+        assert result["flag"].tolist() == [1, 0]
 
     def test_cast_invalid_column(self, sample_df):
         with pytest.raises(TransformationError, match="not found"):
@@ -1145,7 +1471,7 @@ class TestApplyLoggedTransformation:
             {"row_params": {"index": 1}},
         )
         assert len(result) == 4
-        assert result.iloc[1]["name"] == " "
+        assert result.iloc[1].isna().all()
 
     # ------------------------------------------------------------------ delRow
     def test_del_row(self, sample_df):
