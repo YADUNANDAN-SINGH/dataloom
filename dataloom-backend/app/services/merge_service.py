@@ -8,14 +8,13 @@ endpoint layer. This mirrors DataLoom's ``transformation_service`` and
 
 from __future__ import annotations
 
-import uuid
 from enum import StrEnum
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from app.schemas import JoinType
+from app.schemas import MAX_MERGE_ROWS_LIMIT, JoinType
 from app.services.transformation_service import TransformationError
 from app.utils.pandas_helpers import map_dtype
 
@@ -84,10 +83,10 @@ def validate_merge_keys(
     return left_keys, right_keys
 
 
-def _build_shadow_keys(df: pd.DataFrame, keys: list[str], prefix: str) -> pd.Series:
+def _build_shadow_keys(df: pd.DataFrame, keys: list[str]) -> pd.Series:
     """Build comparable shadow keys for matching where NaNs never equal NaNs and types align cleanly.
 
-    - Generates unique non-matching tokens for every NaN value so missing keys never compare equal or join.
+    - Generates unique non-matching object tokens for every NaN value so missing keys never join.
     - Preserves string keys with leading zeros (e.g. '007') as exact text without converting to numbers.
     - Handles single and composite multi-column keys identically with tuple aggregation.
     """
@@ -95,7 +94,7 @@ def _build_shadow_keys(df: pd.DataFrame, keys: list[str], prefix: str) -> pd.Ser
     def _format_component(series: pd.Series) -> pd.Series:
         def _fmt(val):
             if pd.isna(val):
-                return f"__loom_null_{prefix}_{uuid.uuid4().hex}__"
+                return object()
             if isinstance(val, (int, np.integer)):
                 return str(val)
             if isinstance(val, (float, np.floating)):
@@ -232,16 +231,11 @@ def analyze_merge(
         }
 
     # Extract key series and compute match rates using shadow keys
-    l_series = _build_shadow_keys(left_df, left_keys, "L")
-    r_series = _build_shadow_keys(right_df, right_keys, "R")
+    l_series = _build_shadow_keys(left_df, left_keys)
+    r_series = _build_shadow_keys(right_df, right_keys)
 
-    def _is_valid_key(val):
-        if isinstance(val, tuple):
-            return not any(isinstance(x, str) and x.startswith("__loom_null_") for x in val)
-        return not (isinstance(val, str) and val.startswith("__loom_null_"))
-
-    left_valid_mask = l_series.map(_is_valid_key)
-    right_valid_mask = r_series.map(_is_valid_key)
+    left_valid_mask = left_df[left_keys].notna().all(axis=1)
+    right_valid_mask = right_df[right_keys].notna().all(axis=1)
 
     left_unique_keys = set(l_series[left_valid_mask].unique())
     right_unique_keys = set(r_series[right_valid_mask].unique())
@@ -355,7 +349,7 @@ def merge_dataframes(
     right_on: list[str] | str | None = None,
     how: str | JoinType = JoinType.INNER,
     suffixes: tuple[str, str] = ("_left", "_right"),
-    max_rows_limit: int | None = 1_000_000,
+    max_rows_limit: int = MAX_MERGE_ROWS_LIMIT,
 ) -> pd.DataFrame:
     """Execute a relational join between two DataFrames with type safety and Cartesian limits.
 
@@ -374,6 +368,13 @@ def merge_dataframes(
     Raises:
         MergeError: On missing keys, type incompatibility, or Cartesian explosion exceeding safety limits.
     """
+    if (
+        isinstance(max_rows_limit, bool)
+        or not isinstance(max_rows_limit, int)
+        or not 1 <= max_rows_limit <= MAX_MERGE_ROWS_LIMIT
+    ):
+        raise MergeError(f"max_rows_limit must be an integer between 1 and {MAX_MERGE_ROWS_LIMIT}.")
+
     how_str = how.value if hasattr(how, "value") else str(how).lower()
     valid_joins = {j.value for j in JoinType}
     if how_str not in valid_joins:
@@ -381,23 +382,22 @@ def merge_dataframes(
 
     left_keys, right_keys = validate_merge_keys(left_df, right_df, left_on, right_on, how_str)
 
-    # Pre-merge row limit check to prevent out-of-memory crashes on Cartesian explosions
-    if max_rows_limit is not None and max_rows_limit > 0:
-        if how_str in (JoinType.cross, JoinType.CROSS, "cross"):
-            est_rows = len(left_df) * len(right_df)
-            if est_rows > max_rows_limit:
-                raise MergeError(
-                    f"Cross join would produce {est_rows:,} rows, exceeding the safety limit of {max_rows_limit:,}."
-                )
-        else:
-            analysis = analyze_merge(left_df, right_df, left_on=left_keys, right_on=right_keys, how=how_str)
-            est_rows = analysis.get("estimated_output_rows", 0)
-            if est_rows > max_rows_limit:
-                raise MergeError(
-                    f"Merge is estimated to produce {est_rows:,} rows, "
-                    f"exceeding the safety ceiling of {max_rows_limit:,} rows. "
-                    "Check for duplicate keys causing a Cartesian explosion."
-                )
+    # Pre-merge row limit check to prevent out-of-memory crashes on Cartesian explosions.
+    if how_str in (JoinType.cross, JoinType.CROSS, "cross"):
+        est_rows = len(left_df) * len(right_df)
+        if est_rows > max_rows_limit:
+            raise MergeError(
+                f"Cross join would produce {est_rows:,} rows, exceeding the safety limit of {max_rows_limit:,}."
+            )
+    else:
+        analysis = analyze_merge(left_df, right_df, left_on=left_keys, right_on=right_keys, how=how_str)
+        est_rows = analysis.get("estimated_output_rows", 0)
+        if est_rows > max_rows_limit:
+            raise MergeError(
+                f"Merge is estimated to produce {est_rows:,} rows, "
+                f"exceeding the safety ceiling of {max_rows_limit:,} rows. "
+                "Check for duplicate keys causing a Cartesian explosion."
+            )
 
     if how_str in (JoinType.cross, JoinType.CROSS, "cross"):
         try:
@@ -407,8 +407,8 @@ def merge_dataframes(
     else:
         left_m = left_df.copy()
         right_m = right_df.copy()
-        left_m["__loom_shadow_L"] = _build_shadow_keys(left_df, left_keys, "L")
-        right_m["__loom_shadow_R"] = _build_shadow_keys(right_df, right_keys, "R")
+        left_m["__loom_shadow_L"] = _build_shadow_keys(left_df, left_keys)
+        right_m["__loom_shadow_R"] = _build_shadow_keys(right_df, right_keys)
 
         try:
             result = pd.merge(
@@ -438,7 +438,7 @@ def merge_dataframes(
                         cols.insert(orig_idx, k)
                         result = result[cols]
 
-    if max_rows_limit is not None and len(result) > max_rows_limit:
+    if len(result) > max_rows_limit:
         raise MergeError(
             f"Merge produced {len(result):,} rows, exceeding the safety ceiling of {max_rows_limit:,} rows. "
             "Check for duplicate keys causing a Cartesian explosion."

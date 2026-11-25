@@ -7,10 +7,13 @@ column conflict handling, type coercion, and Cartesian safety guardrails.
 
 from __future__ import annotations
 
+from inspect import signature
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from app.schemas import MAX_MERGE_ROWS_LIMIT
 from app.services.merge_service import (
     MergeError,
     RelationshipType,
@@ -218,6 +221,60 @@ class TestMergeExecution:
         assert analysis["matched_left_rows"] == 1
         assert analysis["estimated_output_rows"] == 1
 
+    @pytest.mark.parametrize("how", ["inner", "left", "right", "outer"])
+    def test_null_keys_do_not_join_each_other_for_any_join_type(self, how):
+        df1 = pd.DataFrame({"id": [np.nan], "val1": ["left"]})
+        df2 = pd.DataFrame({"id": [np.nan], "val2": ["right"]})
+
+        result = merge_dataframes(df1, df2, left_on="id", right_on="id", how=how)
+        analysis = analyze_merge(df1, df2, left_on="id", right_on="id", how=how)
+
+        expected_rows = {"inner": 0, "left": 1, "right": 1, "outer": 2}[how]
+        assert len(result) == expected_rows
+        assert analysis["estimated_output_rows"] == expected_rows
+        assert analysis["matched_left_rows"] == 0
+        assert analysis["matched_right_rows"] == 0
+
+    @pytest.mark.parametrize("how", ["inner", "left", "right", "outer"])
+    def test_null_prefix_strings_are_counted_as_real_keys(self, how):
+        prefix_key = "__loom_null_L_user__"
+        df1 = pd.DataFrame({"key": [prefix_key] * 3, "val1": range(3)})
+        df2 = pd.DataFrame({"key": [prefix_key] * 3, "val2": range(3)})
+
+        analysis = analyze_merge(df1, df2, left_on="key", right_on="key", how=how)
+        result = merge_dataframes(df1, df2, left_on="key", right_on="key", how=how)
+
+        assert analysis["matched_left_rows"] == 3
+        assert analysis["matched_right_rows"] == 3
+        assert analysis["estimated_output_rows"] == 9
+        assert len(result) == 9
+
+    def test_composite_prefix_keys_are_counted_as_real_keys(self):
+        prefix_key = "__loom_null_L_user__"
+        df1 = pd.DataFrame({"code": [prefix_key] * 3, "group": ["a"] * 3})
+        df2 = pd.DataFrame({"ref": [prefix_key] * 3, "category": ["a"] * 3})
+
+        analysis = analyze_merge(df1, df2, left_on=["code", "group"], right_on=["ref", "category"])
+        result = merge_dataframes(df1, df2, left_on=["code", "group"], right_on=["ref", "category"])
+
+        assert analysis["matched_left_rows"] == 3
+        assert analysis["matched_right_rows"] == 3
+        assert analysis["estimated_output_rows"] == 9
+        assert len(result) == 9
+
+    def test_sentinel_shaped_string_does_not_match_a_null_key(self):
+        literal_sentinel = "__loom_null_L_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa__"
+        df1 = pd.DataFrame({"key": [np.nan]})
+        df2 = pd.DataFrame({"key": [literal_sentinel]})
+
+        analysis = analyze_merge(df1, df2, left_on="key", right_on="key")
+        result = merge_dataframes(df1, df2, left_on="key", right_on="key")
+
+        assert analysis["matched_left_rows"] == 0
+        assert analysis["matched_right_rows"] == 0
+        assert analysis["estimated_output_rows"] == 0
+        assert result.empty
+
     def test_leading_zero_string_keys_preserved(self):
         """String keys with leading zeros (e.g. '007') are preserved as exact text and not cast to numbers."""
         df1 = pd.DataFrame({"code": ["007", "042"], "agent": ["Bond", "Hitchhiker"]})
@@ -295,10 +352,40 @@ class TestSafetyGuardrails:
         with pytest.raises(MergeError, match="exceeding the safety ceiling of 1,000 rows"):
             merge_dataframes(df1, df2, left_on="key", right_on="key", how="inner", max_rows_limit=1_000)
 
-    def test_pre_merge_row_limit_aborts_non_cross_cartesian_explosion(self):
+    @pytest.mark.parametrize("max_rows_limit", [1, MAX_MERGE_ROWS_LIMIT, None], ids=["minimum", "ceiling", "default"])
+    def test_valid_row_limit_boundaries_are_accepted(self, max_rows_limit):
+        df1 = pd.DataFrame({"key": [1]})
+        df2 = pd.DataFrame({"key": [1]})
+        kwargs = {} if max_rows_limit is None else {"max_rows_limit": max_rows_limit}
+
+        if max_rows_limit is None:
+            assert signature(merge_dataframes).parameters["max_rows_limit"].default == MAX_MERGE_ROWS_LIMIT
+
+        result = merge_dataframes(df1, df2, left_on="key", right_on="key", **kwargs)
+
+        assert len(result) == 1
+
+    @pytest.mark.parametrize("max_rows_limit", [None, 0, -1, MAX_MERGE_ROWS_LIMIT + 1])
+    def test_invalid_row_limits_are_rejected_before_merge(self, max_rows_limit, monkeypatch):
+        df1 = pd.DataFrame({"key": [1]})
+        df2 = pd.DataFrame({"key": [1]})
+
+        def unexpected_merge(*args, **kwargs):
+            pytest.fail("pandas.merge must not run for an invalid row limit")
+
+        monkeypatch.setattr("app.services.merge_service.pd.merge", unexpected_merge)
+        with pytest.raises(MergeError, match="max_rows_limit must be an integer"):
+            merge_dataframes(df1, df2, left_on="key", right_on="key", max_rows_limit=max_rows_limit)
+
+    def test_pre_merge_row_limit_aborts_non_cross_cartesian_explosion(self, monkeypatch):
         """Pre-merge analysis aborts before pd.merge materialization when row ceiling is exceeded."""
         df1 = pd.DataFrame({"key": [1] * 500, "val1": range(500)})
         df2 = pd.DataFrame({"key": [1] * 500, "val2": range(500)})
+
+        def unexpected_merge(*args, **kwargs):
+            pytest.fail("pandas.merge must not run when the estimated output exceeds the limit")
+
+        monkeypatch.setattr("app.services.merge_service.pd.merge", unexpected_merge)
         # 500 * 500 = 250,000 rows
         with pytest.raises(MergeError, match="exceeding the safety ceiling of 10,000 rows"):
             merge_dataframes(df1, df2, left_on="key", right_on="key", how="inner", max_rows_limit=10_000)
