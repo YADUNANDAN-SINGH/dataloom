@@ -839,3 +839,65 @@ def test_transform_cell_edit_with_list_value_on_mixed_column_returns_400(client,
     )
     assert response.status_code == 400, response.text
     assert "single value" in response.json()["detail"]
+
+
+def test_transform_pivot_with_colliding_column_values_returns_400(client, tmp_path):
+    """A JSON upload whose records disagree on a key's type leaves a mixed
+    pivot column (1 and "1"). Pivoting on it used to succeed with two columns
+    both named "1" — an ambiguous dataset where deleting one column deleted
+    both. It must be a 400 instead."""
+    import json
+
+    path = tmp_path / "mixed.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"grp": "x", "cat": 1, "v": 10},
+                {"grp": "x", "cat": "1", "v": 20},
+                {"grp": "x", "cat": 1, "v": 30},
+            ]
+        )
+    )
+    with open(path, "rb") as f:
+        upload = client.post(
+            "/projects/upload",
+            files={"file": ("mixed.json", f, "application/json")},
+            data={"projectName": "Mixed", "projectDescription": "fixture"},
+        )
+    assert upload.status_code == 200, upload.text
+    pid = upload.json()["project_id"]
+    response = client.post(
+        f"/projects/{pid}/transform",
+        json={
+            "operation_type": "pivotTables",
+            "pivot_query": {"index": "grp", "column": "cat", "value": "v", "aggfun": "sum"},
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "duplicate column names" in response.json()["detail"]
+
+
+def test_transform_formula_int_overflow_rejected(client, project_id):
+    response = client.post(
+        f"/projects/{project_id}/transform",
+        json={
+            "operation_type": "addFormulaCol",
+            "formula_col_params": {"column_name": "big", "expression": "age ** 1000"},
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "overflows" in response.json()["detail"]
+
+
+def test_transform_formula_in_range_int_allowed(client, project_id):
+    response = client.post(
+        f"/projects/{project_id}/transform",
+        json={
+            "operation_type": "addFormulaCol",
+            "formula_col_params": {"column_name": "next_age", "expression": "age + 1"},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert "next_age" in response.json()["columns"]
